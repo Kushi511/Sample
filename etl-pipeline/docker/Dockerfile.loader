@@ -1,0 +1,40 @@
+#FROM python:3.9-slim
+
+#WORKDIR /app
+
+# Install dependencies
+#COPY requirements.txt .
+#RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy source code
+#COPY src/loader.py /app/loader.py
+
+# Set execution permissions
+#RUN chmod +x /app/loader.py
+
+#CMD ["python", "/app/src/loader.py"]
+
+
+
+FROM python:3.9-slim
+
+# Create non-root user and group
+RUN addgroup --system appgroup && adduser --system --ingroup appgroup appuser
+
+# Set working directory
+WORKDIR /app
+
+# Copy and install dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy source code and ensure correct ownership
+COPY src/ /app/src/
+
+# Set execute permissions on the script
+RUN chmod +x /app/src/loader.py
+
+USER 1001
+
+# Run your app
+CMD ["python", "/app/src/loader.py"]

@@ -1,0 +1,49 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: load-${TABLE_NAME}
+  namespace: di-kubernets-staging
+  labels:
+    app: etl-loader
+    table: ${TABLE_NAME}
+spec:
+  parallelism: 1
+  completions: 1
+  backoffLimit: 3
+  template:
+    metadata:
+      labels:
+        app: etl-loader
+        table: ${TABLE_NAME}
+    spec:
+      containers:
+      - name: loader
+        image: your-registry/data-loader:latest
+        resources:
+          requests:
+            memory: "4Gi"
+            cpu: "2"
+          limits:
+            memory: "8Gi"
+            cpu: "4"
+        env:
+        - name: SOURCE_TABLE
+          value: "${TABLE_NAME}"
+        - name: DESTINATION_TABLE
+          value: "${DESTINATION_TABLE}"
+        - name: GCS_BUCKET
+          value: "${GCS_BUCKET}"
+        - name: DATA_DIR
+          value: "${TABLE_NAME}"
+        - name: BATCH_SIZE
+          value: "5000"
+        - name: BIGQUERY_PROJECT
+          value: "${BIGQUERY_PROJECT}"
+        - name: BIGQUERY_DATASET
+          value: "${BIGQUERY_DATASET}"
+        - name: GCP_CREDENTIALS_BASE64
+          valueFrom:
+            secretKeyRef:
+              name: gcp-credentials-base64
+              key: credentials
+      restartPolicy: OnFailure

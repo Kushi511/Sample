@@ -1,0 +1,57 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: extract-${TABLE_NAME}-${PARTITION_ID}
+  namespace: di-kubernets-staging
+  labels:
+    app: etl-extractor
+    table: ${TABLE_NAME}
+    partition: "${PARTITION_ID}"
+spec:
+  parallelism: 1
+  completions: 1
+  backoffLimit: 3
+  template:
+    metadata:
+      labels:
+        app: etl-extractor
+        table: ${TABLE_NAME}
+    spec:
+      containers:
+      - name: extractor
+        image: your-registry/data-extractor:latest
+        resources:
+          requests:
+            memory: "4Gi"
+            cpu: "2"
+          limits:
+            memory: "8Gi"
+            cpu: "4"
+        env:
+        - name: POSTGRES_CONNECTION
+          valueFrom:
+            secretKeyRef:
+              name: db-credentials
+              key: connection-string
+        - name: TABLE_NAME
+          value: "${TABLE_NAME}"
+        - name: PARTITION_ID
+          value: "${PARTITION_ID}"
+        - name: TOTAL_PARTITIONS
+          value: "${TOTAL_PARTITIONS}"
+        - name: PRIMARY_KEY
+          value: "${PRIMARY_KEY}"
+        - name: CHUNK_SIZE
+          value: "250000"
+        - name: GCS_BUCKET
+          value: "${GCS_BUCKET}"
+        - name: OUTPUT_DIR
+          value: "${TABLE_NAME}/${PARTITION_ID}"
+        - name: COMPRESSION_LEVEL
+          value: "9"
+        - name: GCP_CREDENTIALS_BASE64
+          valueFrom:
+            secretKeyRef:
+              name: gcp-credentials-base64
+              key: credentials
+      restartPolicy: OnFailure

@@ -1,0 +1,13 @@
+apiVersion: cosmas.k8s.cloudflare.com/v1
+kind: ResourceAllocation
+metadata:
+  name: allocation
+  namespace: di-kubernets-staging
+spec:
+  hard:
+    count/jobs.batch: 500
+    pods: 30
+    requests.cpu: 30
+    limits.cpu: 16
+    requests.memory: 60Gi
+    limits.memory: 80Gi

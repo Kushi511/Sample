@@ -1,0 +1,62 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: etl-controller
+  namespace: di-kubernets-staging
+spec:
+  schedule: "*/2 * * * *"
+  startingDeadlineSeconds: 0
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          tolerations:
+          - key: "rook.cfops.net/rook-ceph-nvme"
+            operator: "Exists"
+            effect: "NoSchedule"
+          - key: "node-role.kubernetes.io/control-plane"
+            operator: "Exists"
+            effect: "NoSchedule"
+          containers:
+          - name: controller
+            image: docker-registry.cfdata.org/u/santhoshi/etl-controller:latestv1@sha256:313a6fb8847039b6c88fb4280846856f0b385efc4e39c7d2a2b8b0cad14faf03
+            imagePullPolicy: Always
+            resources:
+              requests:
+                memory: "1Gi"
+                cpu: "500m"
+              limits:
+                memory: "2Gi"
+                cpu: "1"
+            env:
+            - name: DB_CONNECTION_STRING
+              valueFrom:
+                secretKeyRef:
+                  name: db-credentials
+                  key: connection-string
+            - name: BIGQUERY_CREDENTIALS
+              valueFrom:
+                secretKeyRef:
+                  name: gcp-credentials
+                  key: service-account-json
+            - name: MAX_CONCURRENT_EXTRACTIONS
+              value: "15"
+            - name: MAX_CONCURRENT_LOADS
+              value: "15"
+            - name: CHUNK_SIZE_MB
+              value: "500"
+            - name: BIGQUERY_PROJECT
+              value: "cloudflare-datainsights"
+            - name: BIGQUERY_DATASET
+              value: "prod_entitlements_stage"
+            volumeMounts:
+            - name: job-templates
+              mountPath: /app/templates
+          volumes:
+          - name: job-templates
+            configMap:
+              name: etl-job-templates
+          restartPolicy: OnFailure

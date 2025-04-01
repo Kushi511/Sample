@@ -1,0 +1,73 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: etl-controller
+  namespace: di-kubernets-staging
+spec:
+  schedule: "0 2 * * *"  # Runs at 2 AM every day
+  concurrencyPolicy: Forbid
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          containers:
+          - name: controller
+            image: docker-registry.cfdata.org/u/santhoshi/etl-controller8:latestv8@sha256:ffb20e2ea35f7130dcbe3d493b3e8d44c58ffd68ad9c3899ee4d2708cebbb85c
+            imagePullPolicy: Always
+            resources:
+              requests:
+                memory: "1Gi"
+                cpu: "500m"
+              limits:
+                memory: "2Gi"
+                cpu: "1"
+            env:
+            - name: DB_CONNECTION_STRING
+              valueFrom:
+                secretKeyRef:
+                  name: db-credentials
+                  key: connection-string
+            - name: GOOGLE_APPLICATION_CREDENTIALS
+              value: /app/credentials.json
+            - name: MAX_CONCURRENT_EXTRACTIONS
+              value: "15"
+            - name: MAX_CONCURRENT_LOADS
+              value: "15"
+            - name: CHUNK_SIZE_MB
+              value: "500"
+            - name: BIGQUERY_PROJECT
+              value: "cloudflare-datainsights"
+            - name: BIGQUERY_DATASET
+              value: "prod_entitlements_stage"
+            securityContext:
+              allowPrivilegeEscalation: false
+              capabilities:
+                drop:
+                - ALL
+            volumeMounts:
+            - name: job-templates
+              mountPath: /app/templates
+            - mountPath: /app/credentials.json
+              name: gcp-credentials
+              subPath: credentials.json
+          volumes:
+          - name: job-templates
+            configMap:
+              name: etl-job-templates
+          - name: gcp-credentials
+            secret:
+              secretName: gcp-credentials
+              defaultMode: 420
+          nodeSelector:
+            kubernetes.io/arch: amd64
+          restartPolicy: OnFailure
+          securityContext:
+            fsGroup: 1
+            runAsGroup: 65532
+            runAsNonRoot: true
+            runAsUser: 65532
+            seccompProfile:
+              localhostProfile: cf.json
+              type: Localhost
+            supplementalGroups:
+            - 1

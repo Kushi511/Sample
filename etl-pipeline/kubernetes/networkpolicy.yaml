@@ -1,0 +1,30 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-egress-dns-and-kubeapi
+  namespace: di-kubernets-staging
+spec:
+  podSelector:
+    matchLabels:
+      app: etl-controller
+  policyTypes:
+    - Egress
+  egress:
+    # ✅ DNS egress
+    - ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+
+    # ✅ Kubernetes API server egress
+    - to:
+        - ipBlock:
+            cidr: 10.36.137.35/32
+        - ipBlock:
+            cidr: 10.36.140.19/32
+        - ipBlock:
+            cidr: 10.36.41.27/32
+      ports:
+        - protocol: TCP
+          port: 6443
