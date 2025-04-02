@@ -27,7 +27,6 @@ logger.info(f"Maximum concurrent loads: {MAX_CONCURRENT_LOADS}")
 DB_CONNECTION_STRING = os.environ.get('DB_CONNECTION_STRING')
 DB_CONNECTION_STRING = "postgresql://diuser_prod:stripe-pipeline-secret@billingdb.postgres.ams.cfdata.org:5432/prod_entitlements"
 logger.info("Database connection established")
-# DB_CONNECTION_STRING = "postgresql://diuser_prod:stripe-pipeline-secret@127.0.0.1:6432/prod_entitlements"
 BIGQUERY_PROJECT = os.environ.get('BIGQUERY_PROJECT', 'cloudflare-datainsights')
 logger.info(f"BigQuery project: {BIGQUERY_PROJECT}")
 BIGQUERY_DATASET = os.environ.get('BIGQUERY_DATASET', 'prod_entitlements_stage')
@@ -105,16 +104,57 @@ def get_config_from_bq():
         """
     client = bigquery.Client()
     query_job = client.query(sql)
-    #logger.info(f"Retrieved {query_job.num_rows} rows from BigQuery for pipeline configuration")
-    #if query_job.num_rows == 0:
-    #    logger.warning("No rows found in the pipeline registry")
-    #    return None
-    # Convert results to a list of dictionaries
     results = []
     for row in query_job:
         results.append(dict(row))
     logger.info(f"Retrieved {results} rows from BigQuery for pipeline configuration")   
     return results
+
+def update_pipeline_status(pipeline_id, status):
+    """Update the status of a pipeline in the BigQuery table."""
+    logger.info(f"Updating status for pipeline {pipeline_id} to {status}")
+    sql = f"""
+        UPDATE cloudflare-datainsights.prod_entitlements_stage.data_pipeline_registry
+        SET status = '{status}'
+        WHERE pipeline_id = '{pipeline_id}'
+    """
+    client = bigquery.Client()
+    query_job = client.query(sql)
+    query_job.result()  # Wait for the query to complete
+    logger.info(f"Status updated for pipeline {pipeline_id} to {status}")
+
+def insert_new_pipeline_record(pipeline_id, new_values):
+    """Insert a new record for the pipeline with updated values."""
+    logger.info(f"Inserting new record for pipeline {pipeline_id}")
+    sql = f"""
+        INSERT INTO cloudflare-datainsights.prod_entitlements_stage.data_pipeline_registry
+        (pipeline_id, run_date, next_refresh_date, refresh_timestamp, min_id, max_id)
+        VALUES (
+            '{pipeline_id}',
+            '{new_values['run_date']}',
+            '{new_values['next_refresh_date']}',
+            '{new_values['refresh_timestamp']}',
+            {new_values['min_id']},
+            {new_values['max_id']}
+        )
+    """
+    client = bigquery.Client()
+    query_job = client.query(sql)
+    query_job.result()  # Wait for the query to complete
+    logger.info(f"New record inserted for pipeline {pipeline_id}")
+
+def delete_old_pipeline_records(pipeline_id):
+    """Delete records older than 8 runs for the given pipeline ID."""
+    logger.info(f"Deleting old records for pipeline {pipeline_id}")
+    sql = f"""
+        DELETE FROM cloudflare-datainsights.prod_entitlements_stage.data_pipeline_registry
+        WHERE pipeline_id = '{pipeline_id}'
+        AND ROW_NUMBER() OVER(PARTITION BY pipeline_id ORDER BY date_of_refresh DESC) > 8
+    """
+    client = bigquery.Client()
+    query_job = client.query(sql)
+    query_job.result()  # Wait for the query to complete
+    logger.info(f"Old records deleted for pipeline {pipeline_id}")
 
 def get_db_connection():
     """Create a connection to the PostgreSQL database"""
@@ -131,11 +171,6 @@ def get_db_connection():
 
 def get_tables_to_process(table):
     """Get list of tables to extract from PostgreSQL with their sizes"""
-    # if TEST_MODE:
-    #     logger.info("Running in test mode, using predefined tables")
-    #     return [{"name": table, "estimated_size_gb": 10} for table in TEST_TABLES if table]
-
-    
     logger.info("Retrieving tables to process from database")
     conn = get_db_connection()
     if not conn:
@@ -143,7 +178,7 @@ def get_tables_to_process(table):
         return []
     
     try:
-        with conn.cursor() as cur:  # Use a with statement to ensure proper cursor handling
+        with conn.cursor() as cur:
             if table['refresh_type'] == 'INCREMENTAL':
                 query = f"""
                     WITH table_size AS (
@@ -204,15 +239,12 @@ def get_tables_to_process(table):
             
             logger.info("Executing query to get table sizes")
             cur.execute(query)
-            # Fetch all results within the cursor context
             results = cur.fetchall()
-            # Process results after fetching them
             tables = [{"name": row[0], "estimated_size_gb": row[1]} for row in results]
             logger.info(f"Found {len(tables)} tables to process")
             for table_info in tables:
                 logger.info(f"Table {table_info['name']}: {table_info['estimated_size_gb']:.2f} GB")
             
-            # Return the size directly if tables exist, otherwise return default value
             return tables[0]['estimated_size_gb'] if tables else 0
             
     except Exception as e:
@@ -229,7 +261,7 @@ def get_primary_key(table_name):
     conn = get_db_connection()
     if not conn:
         logger.warning(f"Using default primary key 'id' for table {table_name} due to connection failure")
-        return "id"  # Default fallback
+        return "id"
     
     try:
         with conn.cursor() as cur:
@@ -249,7 +281,7 @@ def get_primary_key(table_name):
     except Exception as e:
         logger.error(f"Error getting primary key for {table_name}: {e}")
         logger.info("Exception details:", exc_info=True)
-        return "id"  # Default fallback
+        return "id"
     finally:
         conn.close()
 
@@ -299,13 +331,11 @@ def create_extraction_job(table_name, partition_id, total_partitions, primary_ke
     job_name = job_name.replace('_','-')
     logger.info(f"Creating extraction job: {job_name}")
     
-    # Load job template
     template_str = load_job_template("extraction-job")
     if not template_str:
         logger.error(f"Failed to create job {job_name}: template loading failed")
         return None
     
-    # Substitute variables
     template = Template(template_str)
     logger.info(f"Substituting variables for job {job_name}")
     job_manifest_str = template.substitute(
@@ -317,16 +347,13 @@ def create_extraction_job(table_name, partition_id, total_partitions, primary_ke
         PRIMARY_KEY_VAL=primary_key_val
     )
     
-    # Parse YAML
     job_manifest = yaml.safe_load(job_manifest_str)
     logger.info(f"Job manifest created for {job_name}")
     logger.debug(f"Initial job manifest: {job_manifest}")
     
-    # Update job name
     job_manifest["metadata"]["name"] = job_name
     logger.debug(f"Job manifest after name update: {job_manifest}")
     
-    # Add labels for easier management
     if "labels" not in job_manifest["metadata"]:
         job_manifest["metadata"]["labels"] = {}
     logger.debug(f"Job manifest after labels check: {job_manifest}")
@@ -338,11 +365,10 @@ def create_extraction_job(table_name, partition_id, total_partitions, primary_ke
         "table": table_name,
         "partition": str(partition_id),
         "created-by": "etl-controller",
-        "primary-key-val": str(primary_key_val)  # Add primary key value as metadata
+        "primary-key-val": str(primary_key_val)
     })
     logger.debug(f"Final job manifest after labels update: {job_manifest}")
     
-    # Create job
     try:
         batch_v1.create_namespaced_job(namespace=NAMESPACE, body=job_manifest)
         logger.info(f"Successfully created extraction job {job_name} for table {table_name}, partition {partition_id}")
@@ -360,17 +386,14 @@ def create_loading_job(table_name):
     job_name = job_name.replace('_','-')
     logger.info(f"Creating loading job: {job_name}")
     
-    # Get destination table name
     destination_table = get_destination_table_name(table_name)
     logger.info(f"Destination table for {job_name}: {destination_table}")
     
-    # Load job template
     template_str = load_job_template("loading-job")
     if not template_str:
         logger.error(f"Failed to create job {job_name}: template loading failed")
         return None
     
-    # Substitute variables
     template = Template(template_str)
     logger.info(f"Substituting variables for job {job_name}")
     job_manifest_str = template.substitute(
@@ -381,14 +404,11 @@ def create_loading_job(table_name):
         GCS_BUCKET=GCS_BUCKET
     )
     
-    # Parse YAML
     job_manifest = yaml.safe_load(job_manifest_str)
     logger.info(f"Job manifest created for {job_name}")
     
-    # Update job name
     job_manifest["metadata"]["name"] = job_name
     
-    # Add labels for easier management
     if "labels" not in job_manifest["metadata"]:
         job_manifest["metadata"]["labels"] = {}
     
@@ -398,7 +418,6 @@ def create_loading_job(table_name):
         "created-by": "etl-controller"
     })
     
-    # Create job
     try:
         batch_v1.create_namespaced_job(namespace=NAMESPACE, body=job_manifest)
         logger.info(f"Successfully created loading job {job_name} for table {table_name}")
@@ -416,60 +435,50 @@ def check_extraction_complete(table_name):
     cfg = kubernetes.client.Configuration.get_default_copy()
     logger.info(cfg.host)
     try:
-        # Get all extraction jobs for this table
         jobs = batch_v1.list_namespaced_job(
             namespace=NAMESPACE,
             label_selector=f"app=etl-extractor,table={table_name}"
         )
         logger.info(f"Found {len(jobs.items)} extraction jobs for table {table_name}")
         
-        # Check if any jobs are still active
         for job in jobs.items:
             if job.status.active is not None and job.status.active > 0:
                 logger.info(f"Job {job.metadata.name} is still active")
                 return False
             
-            # Check if any jobs failed
             if job.status.failed is not None and job.status.failed > 0:
                 if job.spec.backoff_limit is not None and job.status.failed > job.spec.backoff_limit:
                     logger.error(f"Extraction job {job.metadata.name} failed after {job.status.failed} attempts")
                     JOBS_FAILED.labels(job_type="extraction", table=table_name).inc()
                     return False
         
-        # If no jobs found, extraction hasn't started
         if not jobs.items:
             logger.info(f"No extraction jobs found for table {table_name}")
             return False
         
-        # Get GCP credentials
         logger.info("Getting GCP credentials")
         credentials_json = get_gcp_credentials()
         if not credentials_json:
             logger.error("Failed to get GCP credentials")
             return False
         
-        # Create a temporary file for credentials
         with tempfile.NamedTemporaryFile(mode='w+', delete=True) as temp:
             temp.write(credentials_json)
             temp.flush()
             logger.info("Temporary credentials file created")
             
-            # Set environment variable to point to the temp file
             os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = temp.name
             
-            # Initialize GCS client
             storage_client = storage.Client()
             bucket = storage_client.bucket(GCS_BUCKET)
             logger.info(f"Connected to GCS bucket: {GCS_BUCKET}")
             
-            # Get all partitions from job labels
             partitions = set()
             for job in jobs.items:
                 partition = job.metadata.labels.get("partition")
                 if partition:
                     partitions.add(partition)
             
-            # Check for _SUCCESS files
             for partition in partitions:
                 success_blob = bucket.blob(f"{table_name}/{partition}/_SUCCESS")
                 if not success_blob.exists():
@@ -484,28 +493,26 @@ def check_extraction_complete(table_name):
 
 def calculate_partitions(table_size_gb):
     """Calculate optimal number of partitions based on table size"""
-    # Minimum 1 partition, maximum 50 partitions
-    # Roughly 1 partition per 5GB of data
     return max(1, min(50, int(table_size_gb / 5) + 1))
 
 def process_table(table):
-    """Process a single table (extraction and loading)"""
+    """Process a single table (extraction and loading)."""
     table_name = table['source_table']
+    pipeline_id = table['pipeline_id']
     table_size = get_tables_to_process(table)
     refresh_type = table['refresh_type']
     primary_key = table['primary_key_column']
     primary_key_val = table['max_id'] if refresh_type == 'INCREMENTAL' else 0
 
-    
-    # Check if extraction is already complete
+    update_pipeline_status(pipeline_id, "In Progress")
+
     if check_extraction_complete(table_name):
-        # Check if loading job already exists
+        update_pipeline_status(pipeline_id, "Loader In Progress")
         loading_jobs = batch_v1.list_namespaced_job(
             namespace=NAMESPACE,
             label_selector=f"app=etl-loader,table={table_name}"
         )
         if not loading_jobs.items:
-            # Create loading job
             active_loads = count_active_jobs(f"app=etl-loader,table={table_name}")
             if active_loads < MAX_CONCURRENT_LOADS:
                 create_loading_job(table_name)
@@ -513,29 +520,23 @@ def process_table(table):
                 logger.info(f"Too many active loading jobs, will try {table_name} later")
         return
     
-    # Check if extraction jobs already exist
     extraction_jobs = batch_v1.list_namespaced_job(
         namespace=NAMESPACE,
         label_selector=f"app=etl-extractor,table={table_name}"
     )
     
     if not extraction_jobs.items:
-        # No extraction jobs exist, create them
+        update_pipeline_status(pipeline_id, "Extract In Progress")
         active_extractions = count_active_jobs(f"app=etl-extractor,table={table_name}")
         if active_extractions < MAX_CONCURRENT_EXTRACTIONS:
-            # Calculate number of partitions based on table size
             total_partitions = calculate_partitions(table_size)
-            
-            # Get primary key for this table
-            #primary_key = get_primary_key(table_name)
-            
-            # Create extraction jobs for each partition
             for partition_id in range(total_partitions):
                 logger.info(f"Creating extraction job for partition {partition_id}")    
                 create_extraction_job(table_name, partition_id, total_partitions, primary_key, primary_key_val)
-                time.sleep(30)  # Sleep to avoid overwhelming the API
+                time.sleep(30)
         else:
             logger.info(f"Too many active extraction jobs, will try {table_name} later")
+
 def cleanup_completed_jobs():
     """Delete completed jobs that are older than 24 hours"""
     try:
@@ -543,14 +544,12 @@ def cleanup_completed_jobs():
         current_time = time.time()
         
         for job in jobs.items:
-            # Skip jobs that are still active
             if job.status.active is not None and job.status.active > 0:
                 continue
                 
-            # Check if job is completed and older than 24 hours
             if job.status.completion_time is not None:
                 completion_time = job.status.completion_time.timestamp()
-                if (current_time - completion_time) > 5:  # 24 hours in seconds
+                if (current_time - completion_time) > 5:
                     try:
                         batch_v1.delete_namespaced_job(
                             name=job.metadata.name,
@@ -568,7 +567,6 @@ def cleanup_completed_jobs():
 def update_metrics_for_table(table_name):
     """Update Prometheus metrics and check job status for a specific table"""
     try:
-        # Update extraction job metrics
         extraction_jobs = batch_v1.list_namespaced_job(
             namespace=NAMESPACE,
             label_selector=f"app=etl-extractor,table={table_name}"
@@ -581,7 +579,6 @@ def update_metrics_for_table(table_name):
             elif job.status.succeeded is not None and job.status.succeeded > 0:
                 table = job.metadata.labels.get("table", "unknown")
                 JOBS_COMPLETED.labels(job_type="extraction", table=table).inc()
-                # Delete completed extraction job
                 batch_v1.delete_namespaced_job(
                     name=job.metadata.name,
                     namespace=NAMESPACE,
@@ -591,7 +588,6 @@ def update_metrics_for_table(table_name):
         
         ACTIVE_JOBS.labels(job_type="extraction").set(active_extractions)
         
-        # Update loading job metrics
         loading_jobs = batch_v1.list_namespaced_job(
             namespace=NAMESPACE,
             label_selector=f"app=etl-loader,table={table_name}"
@@ -604,7 +600,6 @@ def update_metrics_for_table(table_name):
             elif job.status.succeeded is not None and job.status.succeeded > 0:
                 table = job.metadata.labels.get("table", "unknown")
                 JOBS_COMPLETED.labels(job_type="loading", table=table).inc()
-                # Delete completed loading job
                 batch_v1.delete_namespaced_job(
                     name=job.metadata.name,
                     namespace=NAMESPACE,
@@ -614,7 +609,6 @@ def update_metrics_for_table(table_name):
         
         ACTIVE_JOBS.labels(job_type="loading").set(active_loads)
         
-        # Return True if both extraction and loading jobs are completed
         return active_extractions == 0 and active_loads == 0
     except ApiException as e:
         logger.error(f"Error updating metrics for table {table_name}: {e}")
@@ -623,76 +617,59 @@ def update_metrics_for_table(table_name):
 def get_gcp_credentials():
     """Get GCP credentials from Kubernetes secret"""
     try:
-        # Get the base64-encoded credentials from the secret
-        v1 = kubernetes.client.CoreV1Api()
-        # secret = v1.read_namespaced_secret(
-        #     name="gcp-credentials-base64",
-        #     namespace=NAMESPACE
-        # )
-        
-        # Decode the base64 credentials
-        #credentials_base64 = secret.data.get("credentials")
-        # if not credentials_base64:
-        #     logger.error("No credentials found in gcp-credentials-base64 secret")
-        #     return None
-        
         credentials_json = base64.b64decode(GCP_CREDENTIALS_BASE64).decode('utf-8')
         return credentials_json
     except Exception as e:
         logger.error(f"Error getting GCP credentials: {e}")
         return None
+
 def run_table(table):
-    """Run the ETL pipeline for a single table"""
-    logger.info(f"Running ETL pipeline for table {table['pipeline_id']}")
+    """Run the ETL pipeline for a single table."""
+    pipeline_id = table['pipeline_id']
+    logger.info(f"Running ETL pipeline for table {pipeline_id}")
     while True:
         try:
-            # Get tables to process
-            # tables = get_tables_to_process()
-            logger.info(f"Running ETL pipeline for table {table['pipeline_id']}")
-            
-            # Process each table
-            
+            logger.info(f"Running ETL pipeline for table {pipeline_id}")
             process_table(table)
-            
-            # Clean up completed jobs
             cleanup_completed_jobs()
-            
-            # Update metrics
             if update_metrics_for_table(table['source_table']):
-                logger.info(f"All jobs completed for table {table['pipeline_id']}, exiting loop")
-                break
-            
-            # Sleep before next iteration
+                new_values = {
+                    "run_date": "CURRENT_DATE",
+                    "next_refresh_date": "DATE_ADD(CURRENT_DATE, INTERVAL 1 DAY)",
+                    "refresh_timestamp": "CURRENT_TIMESTAMP",
+                    "min_id": 0,
+                    "max_id": 1000,
+                }
+                insert_new_pipeline_record(pipeline_id, new_values)
+                delete_old_pipeline_records(pipeline_id)
+                logger.info(f"All jobs completed for table {pipeline_id}, exiting loop")
+                return
             logger.info("Sleeping for 1 min before next check")
-            time.sleep(60)  # 1 minutes
+            time.sleep(60)
         except Exception as e:
             logger.error(f"Error in main loop: {e}")
-            time.sleep(60)  # Sleep for 1 minute on error
+            time.sleep(60)
 
-    
 def main():
     """Main controller loop"""
-    # Start Prometheus metrics server
     start_http_server(8000)
     logger.info("ETL controller started")
     if not setup_gcp_credentials():
         logger.info("Failed to setup GCP credentials")
-        # sys.exit(1)
     table_config = get_config_from_bq()
     threads = []
     for table in table_config:
         logger.info(f"Pipeline configuration for table {table['pipeline_id']}: {table}")
-        # Create and start a thread for each table
         thread = threading.Thread(target=run_table, args=(table,))
         threads.append(thread)
         thread.start()
         logger.info(f"Started thread for table {table['pipeline_id']}")
     
-    # Wait for all threads to complete
     for thread in threads:
         logger.info(f"Waiting for thread {thread.name} to complete...")
         thread.join()
         logger.info(f"Thread {thread.name} completed")
     logger.info("All table processing threads completed")
+
 if __name__ == "__main__":
     main()
