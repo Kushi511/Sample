@@ -127,6 +127,86 @@ def get_config_from_bq():
         results.append(dict(row))
     logger.info(f"Retrieved {results} rows from BigQuery for pipeline configuration")   
     return results
+def insert_run_record(run_id, table, status):
+    """Insert a new record for the run in the BigQuery table."""
+    logger.info(f"Inserting new run record for run_id {run_id}, pipeline_id {table['pipeline_id']}")
+    # Validate required keys
+    required_keys = [
+        'pipeline_id', 'source_dataset', 'source_table', 'primary_key_column',
+        'min_id', 'max_id', 'record_count', 'partition_column', 'refresh_type',
+        'refresh_frequency', 'next_refresh_timestamp', 'notes', 'target_project',
+        'target_dataset', 'target_table', 'skip_table'
+    ]
+    for key in required_keys:
+        if key not in table or table[key] is None:
+            logger.error(f"Missing or invalid value for key '{key}' in table dictionary")
+            return
+
+    # Construct SQL query with parameterized values
+    sql = """
+        INSERT INTO cloudflare-datainsights.prod_entitlements_stage.data_pipeline_registry
+        (run_id, pipeline_id, status, run_date, refresh_timestamp, source_dataset, source_table, primary_key_column, min_id, max_id, record_count, partition_column, refresh_type, refresh_frequency, next_refresh_timestamp, date_of_refresh, notes, target_project, target_dataset, target_table, skip_table)
+        VALUES (
+            @run_id,
+            @pipeline_id,
+            @status,
+            CURRENT_DATE(),
+            CURRENT_TIMESTAMP(),
+            @source_dataset,
+            @source_table,
+            @primary_key_column,
+            @min_id,
+            @max_id,
+            @record_count,
+            @partition_column,
+            @refresh_type,
+            @refresh_frequency,
+            @next_refresh_timestamp,
+            CURRENT_DATE(),
+            @notes,
+            @target_project,
+            @target_dataset,
+            @target_table,
+            @skip_table
+            @date_of_refresh
+        )
+    """
+
+    query_params = [
+        bigquery.ScalarQueryParameter("run_id", "STRING", run_id),
+        bigquery.ScalarQueryParameter("pipeline_id", "STRING", table['pipeline_id']),
+        bigquery.ScalarQueryParameter("status", "STRING", status),
+        bigquery.ScalarQueryParameter("source_dataset", "STRING", table['source_dataset']),
+        bigquery.ScalarQueryParameter("source_table", "STRING", table['source_table']),
+        bigquery.ScalarQueryParameter("primary_key_column", "STRING", table['primary_key_column']),
+        bigquery.ScalarQueryParameter("min_id", "INT64", table['min_id']),
+        bigquery.ScalarQueryParameter("max_id", "INT64", table['max_id']),
+        bigquery.ScalarQueryParameter("record_count", "INT64", table['record_count']),
+        bigquery.ScalarQueryParameter("partition_column", "STRING", table['partition_column']),
+        bigquery.ScalarQueryParameter("refresh_type", "STRING", table['refresh_type']),
+        bigquery.ScalarQueryParameter("refresh_frequency", "STRING", table['refresh_frequency']),
+        bigquery.ScalarQueryParameter("next_refresh_timestamp", "STRING", table['next_refresh_timestamp']),
+        bigquery.ScalarQueryParameter("notes", "STRING", table['notes']),
+        bigquery.ScalarQueryParameter("target_project", "STRING", table['target_project']),
+        bigquery.ScalarQueryParameter("target_dataset", "STRING", table['target_dataset']),
+        bigquery.ScalarQueryParameter("target_table", "STRING", table['target_table']),
+        bigquery.ScalarQueryParameter("skip_table", "STRING", table['skip_table']),
+
+    ]
+
+    try:
+        logger.info(f"SQL Query: {sql}")
+        logger.info(f"Query Parameters: {query_params}")
+        
+        client = bigquery.Client()
+        job_config = bigquery.QueryJobConfig(query_parameters=query_params)
+        execute_with_retry(client.query, sql, job_config=job_config)
+        logger.info(f"Run record inserted for run_id {run_id}, pipeline_id {table['pipeline_id']}")
+    except Exception as e:
+        logger.error(f"Failed to insert run record for run_id {run_id}: {e}")
+
+
+
 
 def update_pipeline_status(pipeline_id, status):
     """Update the status of a pipeline in the BigQuery table."""
@@ -140,24 +220,6 @@ def update_pipeline_status(pipeline_id, status):
     execute_with_retry(client.query, sql)
     logger.info(f"Status updated for pipeline {pipeline_id} to {status}")
 
-def insert_new_pipeline_record(pipeline_id, new_values):
-    """Insert a new record for the pipeline with updated values."""
-    logger.info(f"Inserting new record for pipeline {pipeline_id}")
-    sql = f"""
-        INSERT INTO cloudflare-datainsights.prod_entitlements_stage.data_pipeline_registry
-        (pipeline_id, run_date, next_refresh_date, refresh_timestamp, min_id, max_id)
-        VALUES (
-            '{pipeline_id}',
-            '{new_values['run_date']}',
-            '{new_values['next_refresh_date']}',
-            '{new_values['refresh_timestamp']}',
-            {new_values['min_id']},
-            {new_values['max_id']}
-        )
-    """
-    client = bigquery.Client()
-    execute_with_retry(client.query, sql)
-    logger.info(f"New record inserted for pipeline {pipeline_id}")
 
 def delete_old_pipeline_records(pipeline_id):
     """Delete records older than 8 runs for the given pipeline ID."""
@@ -638,80 +700,6 @@ def get_gcp_credentials():
         logger.error(f"Error getting GCP credentials: {e}")
         return None
 
-def insert_run_record(run_id, table, status):
-    """Insert a new record for the run in the BigQuery table."""
-    logger.info(f"Inserting new run record for run_id {run_id}, pipeline_id {table['pipeline_id']}")
-    # Validate required keys
-    required_keys = [
-        'pipeline_id', 'source_dataset', 'source_table', 'primary_key_column',
-        'min_id', 'max_id', 'record_count', 'partition_column', 'refresh_type',
-        'refresh_frequency', 'next_refresh_timestamp', 'notes', 'target_project',
-        'target_dataset', 'target_table', 'skip_table'
-    ]
-    for key in required_keys:
-        if key not in table or table[key] is None:
-            logger.error(f"Missing or invalid value for key '{key}' in table dictionary")
-            return
-
-    # Construct SQL query with parameterized values
-    sql = """
-        INSERT INTO cloudflare-datainsights.prod_entitlements_stage.data_pipeline_registry
-        (run_id, pipeline_id, status, run_date, refresh_timestamp, source_dataset, source_table, primary_key_column, min_id, max_id, record_count, partition_column, refresh_type, refresh_frequency, next_refresh_timestamp, date_of_refresh, notes, target_project, target_dataset, target_table, skip_table)
-        VALUES (
-            @run_id,
-            @pipeline_id,
-            @status,
-            CURRENT_DATE(),
-            CURRENT_TIMESTAMP(),
-            @source_dataset,
-            @source_table,
-            @primary_key_column,
-            @min_id,
-            @max_id,
-            @record_count,
-            @partition_column,
-            @refresh_type,
-            @refresh_frequency,
-            @next_refresh_timestamp,
-            CURRENT_DATE(),
-            @notes,
-            @target_project,
-            @target_dataset,
-            @target_table,
-            @skip_table
-        )
-    """
-    query_params = [
-        bigquery.ScalarQueryParameter("run_id", "STRING", run_id),
-        bigquery.ScalarQueryParameter("pipeline_id", "STRING", table['pipeline_id']),
-        bigquery.ScalarQueryParameter("status", "STRING", status),
-        bigquery.ScalarQueryParameter("source_dataset", "STRING", table['source_dataset']),
-        bigquery.ScalarQueryParameter("source_table", "STRING", table['source_table']),
-        bigquery.ScalarQueryParameter("primary_key_column", "STRING", table['primary_key_column']),
-        bigquery.ScalarQueryParameter("min_id", "INT64", table['min_id']),
-        bigquery.ScalarQueryParameter("max_id", "INT64", table['max_id']),
-        bigquery.ScalarQueryParameter("record_count", "INT64", table['record_count']),
-        bigquery.ScalarQueryParameter("partition_column", "STRING", table['partition_column']),
-        bigquery.ScalarQueryParameter("refresh_type", "STRING", table['refresh_type']),
-        bigquery.ScalarQueryParameter("refresh_frequency", "STRING", table['refresh_frequency']),
-        bigquery.ScalarQueryParameter("next_refresh_timestamp", "STRING", table['next_refresh_timestamp']),
-        bigquery.ScalarQueryParameter("notes", "STRING", table['notes']),
-        bigquery.ScalarQueryParameter("target_project", "STRING", table['target_project']),
-        bigquery.ScalarQueryParameter("target_dataset", "STRING", table['target_dataset']),
-        bigquery.ScalarQueryParameter("target_table", "STRING", table['target_table']),
-        bigquery.ScalarQueryParameter("skip_table", "STRING", table['skip_table']),
-    ]
-
-    try:
-        logger.debug(f"SQL Query: {sql}")
-        logger.debug(f"Query Parameters: {query_params}")
-        
-        client = bigquery.Client()
-        job_config = bigquery.QueryJobConfig(query_parameters=query_params)
-        execute_with_retry(client.query, sql, job_config=job_config)
-        logger.info(f"Run record inserted for run_id {run_id}, pipeline_id {table['pipeline_id']}")
-    except Exception as e:
-        logger.error(f"Failed to insert run record for run_id {run_id}: {e}")
 
 def update_run_status(run_id, status):
     """Update the status of a run in the BigQuery table."""
