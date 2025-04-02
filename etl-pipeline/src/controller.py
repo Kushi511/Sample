@@ -14,6 +14,8 @@ import base64
 import json
 import tempfile
 import threading
+from google.api_core.exceptions import GoogleAPICallError, TooManyRequests
+import uuid  # Add import for UUID generation
 
 logging.basicConfig(level=logging.INFO,format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger('etl-controller')
@@ -68,6 +70,22 @@ def setup_gcp_credentials():
         logger.error(f"Error setting up GCP credentials: {e}")
         return False
 
+def execute_with_retry(query_func, *args, **kwargs):
+    """Retry wrapper for BigQuery DML operations with exponential backoff."""
+    max_retries = 5
+    delay = 1  # Initial delay in seconds
+    for attempt in range(max_retries):
+        try:
+            return query_func(*args, **kwargs)
+        except (GoogleAPICallError, TooManyRequests) as e:
+            if attempt < max_retries - 1:
+                logger.warning(f"Retrying due to error: {e}. Attempt {attempt + 1}/{max_retries}")
+                time.sleep(delay)
+                delay *= 2  # Exponential backoff
+            else:
+                logger.error(f"Max retries reached. Failed to execute query: {e}")
+                raise
+
 def get_config_from_bq():
     """Get config from bq  cloudflare-datainsights.prod_entitlements_stage.data_pipeline_registry """
     sql="""
@@ -119,8 +137,7 @@ def update_pipeline_status(pipeline_id, status):
         WHERE pipeline_id = '{pipeline_id}'
     """
     client = bigquery.Client()
-    query_job = client.query(sql)
-    query_job.result()  # Wait for the query to complete
+    execute_with_retry(client.query, sql)
     logger.info(f"Status updated for pipeline {pipeline_id} to {status}")
 
 def insert_new_pipeline_record(pipeline_id, new_values):
@@ -139,8 +156,7 @@ def insert_new_pipeline_record(pipeline_id, new_values):
         )
     """
     client = bigquery.Client()
-    query_job = client.query(sql)
-    query_job.result()  # Wait for the query to complete
+    execute_with_retry(client.query, sql)
     logger.info(f"New record inserted for pipeline {pipeline_id}")
 
 def delete_old_pipeline_records(pipeline_id):
@@ -152,8 +168,7 @@ def delete_old_pipeline_records(pipeline_id):
         AND ROW_NUMBER() OVER(PARTITION BY pipeline_id ORDER BY date_of_refresh DESC) > 8
     """
     client = bigquery.Client()
-    query_job = client.query(sql)
-    query_job.result()  # Wait for the query to complete
+    execute_with_retry(client.query, sql)
     logger.info(f"Old records deleted for pipeline {pipeline_id}")
 
 def get_db_connection():
@@ -495,7 +510,7 @@ def calculate_partitions(table_size_gb):
     """Calculate optimal number of partitions based on table size"""
     return max(1, min(50, int(table_size_gb / 5) + 1))
 
-def process_table(table):
+def process_table(table, run_id):
     """Process a single table (extraction and loading)."""
     table_name = table['source_table']
     pipeline_id = table['pipeline_id']
@@ -504,10 +519,10 @@ def process_table(table):
     primary_key = table['primary_key_column']
     primary_key_val = table['max_id'] if refresh_type == 'INCREMENTAL' else 0
 
-    update_pipeline_status(pipeline_id, "In Progress")
+    update_run_status(run_id, "In Progress")
 
     if check_extraction_complete(table_name):
-        update_pipeline_status(pipeline_id, "Loader In Progress")
+        update_run_status(run_id, "Loader In Progress")
         loading_jobs = batch_v1.list_namespaced_job(
             namespace=NAMESPACE,
             label_selector=f"app=etl-loader,table={table_name}"
@@ -526,7 +541,7 @@ def process_table(table):
     )
     
     if not extraction_jobs.items:
-        update_pipeline_status(pipeline_id, "Extract In Progress")
+        update_run_status(run_id, "Extract In Progress")
         active_extractions = count_active_jobs(f"app=etl-extractor,table={table_name}")
         if active_extractions < MAX_CONCURRENT_EXTRACTIONS:
             total_partitions = calculate_partitions(table_size)
@@ -623,31 +638,112 @@ def get_gcp_credentials():
         logger.error(f"Error getting GCP credentials: {e}")
         return None
 
-def run_table(table):
+def insert_run_record(run_id, table, status):
+    """Insert a new record for the run in the BigQuery table."""
+    logger.info(f"Inserting new run record for run_id {run_id}, pipeline_id {table['pipeline_id']}")
+    # Validate required keys
+    required_keys = [
+        'pipeline_id', 'source_dataset', 'source_table', 'primary_key_column',
+        'min_id', 'max_id', 'record_count', 'partition_column', 'refresh_type',
+        'refresh_frequency', 'next_refresh_timestamp', 'notes', 'target_project',
+        'target_dataset', 'target_table', 'skip_table'
+    ]
+    for key in required_keys:
+        if key not in table or table[key] is None:
+            logger.error(f"Missing or invalid value for key '{key}' in table dictionary")
+            return
+
+    # Construct SQL query with parameterized values
+    sql = """
+        INSERT INTO cloudflare-datainsights.prod_entitlements_stage.data_pipeline_registry
+        (run_id, pipeline_id, status, run_date, refresh_timestamp, source_dataset, source_table, primary_key_column, min_id, max_id, record_count, partition_column, refresh_type, refresh_frequency, next_refresh_timestamp, date_of_refresh, notes, target_project, target_dataset, target_table, skip_table)
+        VALUES (
+            @run_id,
+            @pipeline_id,
+            @status,
+            CURRENT_DATE(),
+            CURRENT_TIMESTAMP(),
+            @source_dataset,
+            @source_table,
+            @primary_key_column,
+            @min_id,
+            @max_id,
+            @record_count,
+            @partition_column,
+            @refresh_type,
+            @refresh_frequency,
+            @next_refresh_timestamp,
+            CURRENT_DATE(),
+            @notes,
+            @target_project,
+            @target_dataset,
+            @target_table,
+            @skip_table
+        )
+    """
+    query_params = [
+        bigquery.ScalarQueryParameter("run_id", "STRING", run_id),
+        bigquery.ScalarQueryParameter("pipeline_id", "STRING", table['pipeline_id']),
+        bigquery.ScalarQueryParameter("status", "STRING", status),
+        bigquery.ScalarQueryParameter("source_dataset", "STRING", table['source_dataset']),
+        bigquery.ScalarQueryParameter("source_table", "STRING", table['source_table']),
+        bigquery.ScalarQueryParameter("primary_key_column", "STRING", table['primary_key_column']),
+        bigquery.ScalarQueryParameter("min_id", "INT64", table['min_id']),
+        bigquery.ScalarQueryParameter("max_id", "INT64", table['max_id']),
+        bigquery.ScalarQueryParameter("record_count", "INT64", table['record_count']),
+        bigquery.ScalarQueryParameter("partition_column", "STRING", table['partition_column']),
+        bigquery.ScalarQueryParameter("refresh_type", "STRING", table['refresh_type']),
+        bigquery.ScalarQueryParameter("refresh_frequency", "STRING", table['refresh_frequency']),
+        bigquery.ScalarQueryParameter("next_refresh_timestamp", "STRING", table['next_refresh_timestamp']),
+        bigquery.ScalarQueryParameter("notes", "STRING", table['notes']),
+        bigquery.ScalarQueryParameter("target_project", "STRING", table['target_project']),
+        bigquery.ScalarQueryParameter("target_dataset", "STRING", table['target_dataset']),
+        bigquery.ScalarQueryParameter("target_table", "STRING", table['target_table']),
+        bigquery.ScalarQueryParameter("skip_table", "STRING", table['skip_table']),
+    ]
+
+    try:
+        logger.debug(f"SQL Query: {sql}")
+        logger.debug(f"Query Parameters: {query_params}")
+        
+        client = bigquery.Client()
+        job_config = bigquery.QueryJobConfig(query_parameters=query_params)
+        execute_with_retry(client.query, sql, job_config=job_config)
+        logger.info(f"Run record inserted for run_id {run_id}, pipeline_id {table['pipeline_id']}")
+    except Exception as e:
+        logger.error(f"Failed to insert run record for run_id {run_id}: {e}")
+
+def update_run_status(run_id, status):
+    """Update the status of a run in the BigQuery table."""
+    logger.info(f"Updating status for run_id {run_id} to {status}")
+    sql = f"""
+        UPDATE cloudflare-datainsights.prod_entitlements_stage.data_pipeline_registry
+        SET status = '{status}', refresh_timestamp = CURRENT_TIMESTAMP
+        WHERE run_id = '{run_id}'
+    """
+    client = bigquery.Client()
+    execute_with_retry(client.query, sql)
+    logger.info(f"Status updated for run_id {run_id} to {status}")
+
+def run_table(table, run_id):
     """Run the ETL pipeline for a single table."""
     pipeline_id = table['pipeline_id']
-    logger.info(f"Running ETL pipeline for table {pipeline_id}")
+    logger.info(f"Running ETL pipeline for table {pipeline_id} with run_id {run_id}")
+    insert_run_record(run_id, table, "Started")
     while True:
         try:
-            logger.info(f"Running ETL pipeline for table {pipeline_id}")
-            process_table(table)
+            logger.info(f"Processing table {pipeline_id} with run_id {run_id}")
+            process_table(table, run_id)
             cleanup_completed_jobs()
             if update_metrics_for_table(table['source_table']):
-                new_values = {
-                    "run_date": "CURRENT_DATE",
-                    "next_refresh_date": "DATE_ADD(CURRENT_DATE, INTERVAL 1 DAY)",
-                    "refresh_timestamp": "CURRENT_TIMESTAMP",
-                    "min_id": 0,
-                    "max_id": 1000,
-                }
-                insert_new_pipeline_record(pipeline_id, new_values)
-                delete_old_pipeline_records(pipeline_id)
+                update_run_status(run_id, "Completed")
                 logger.info(f"All jobs completed for table {pipeline_id}, exiting loop")
                 return
             logger.info("Sleeping for 1 min before next check")
             time.sleep(60)
         except Exception as e:
-            logger.error(f"Error in main loop: {e}")
+            logger.error(f"Error in main loop for run_id {run_id}: {e}")
+            update_run_status(run_id, "Failed")
             time.sleep(60)
 
 def main():
@@ -657,19 +753,22 @@ def main():
     if not setup_gcp_credentials():
         logger.info("Failed to setup GCP credentials")
     table_config = get_config_from_bq()
+    run_id = str(uuid.uuid4())  # Generate a unique run_id
+    logger.info(f"Generated run_id for this execution: {run_id}")
     threads = []
     for table in table_config:
         logger.info(f"Pipeline configuration for table {table['pipeline_id']}: {table}")
-        thread = threading.Thread(target=run_table, args=(table,))
+        thread = threading.Thread(target=run_table, args=(table, run_id))
         threads.append(thread)
         thread.start()
-        logger.info(f"Started thread for table {table['pipeline_id']}")
+        logger.info(f"Started thread for table {table['pipeline_id']} with run_id {run_id}")
     
     for thread in threads:
         logger.info(f"Waiting for thread {thread.name} to complete...")
         thread.join()
         logger.info(f"Thread {thread.name} completed")
     logger.info("All table processing threads completed")
+    update_run_status(run_id, "Completed")  # Mark the entire run as completed
 
 if __name__ == "__main__":
     main()
